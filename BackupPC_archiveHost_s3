@@ -98,10 +98,10 @@ def encrypt_file(filename, key, compress='/bin/cat'):
         raise RuntimeError('output file does not exist: %s.gpg' % filename)
 
 def open_glacier(accessKey, sharedKey, host):
-	conn = boto.connect_glacier(aws_access_key_id=accessJet,
+    conn = boto.connect_glacier(aws_access_key_id=accessJet,
                                     aws_secret_access_key=sharedKey)
-	myvaultname = (accesskey + '-bkup-' + host)
-	try:
+    myvaultname = (accesskey + '-bkup-' + host)
+    try:
         bucket = conn.get_vault(mybucketname)
     except boto.exception.S3ResponseError:
         logger.info('open_glacier: creating new vault %s' % mybucketname)
@@ -140,6 +140,8 @@ def verify_file(bucket, filename):
 def send_file_glacier(vault, filename)
     basefilename = os.path.basename(filename)
     id = vault.upload_archive(filename)
+
+    return id
 
 def send_file(bucket, filename):
     basefilename = os.path.basename(filename)
