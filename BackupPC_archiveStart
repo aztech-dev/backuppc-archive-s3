@@ -5,7 +5,7 @@
 # command line.
 #
 # DESCRIPTION
-#  
+#
 #   Usage: BackupPC_archiveStart archiveHost userName hosts...
 #
 #   Initiates an archive request on archive host archiveHost
@@ -73,7 +73,7 @@ $bpc->ConfigRead($ArchiveHost);
 my(@HostList, @BackupList);
 for ( my $i = 2 ; $i < @ARGV ; $i++ ) {
     my $host = $ARGV[$i];
-    if ( !defined($Hosts->{$host}) ) {
+    if ( !defined($Hosts->{$host}) ) {/usr/share/backuppc/bin/BackupPC_archiveHost_s3 /usr/share/backuppc/bin/BackupPC_tarCreate /usr/bin/split /usr/bin/par $host /bin/bzip2 .bz2 $splitsize /var/lib/backuppc/data/glacier-buffer $parFile *
         print(STDERR "$0: host $host doesn't exist... quitting\n");
         exit(1);
     }
