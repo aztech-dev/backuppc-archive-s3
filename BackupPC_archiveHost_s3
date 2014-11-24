@@ -137,7 +137,7 @@ def verify_file(bucket, filename):
                 return True
     return False
 
-def send_file_glacier(vault, filename)
+def send_file_glacier(vault, filename):
     basefilename = os.path.basename(filename)
     id = vault.upload_archive(filename)
 
