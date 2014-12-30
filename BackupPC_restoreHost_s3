@@ -1,0 +1,106 @@
+#!/usr/bin/python -W ignore::DeprecationWarning
+# A BackupPC script to archive a host's files to Amazon S3.
+#
+# Point $Conf{ArchiveClientCmd} at me.
+# Requires python-boto
+#
+# Usage: BackupPC_archiveHost tarCreatePath splitPath parPath host bkupNum \
+#             compPath fileExt splitSize outLoc parFile share
+#
+# Create secrets.py such that it has:
+# accesskey = 'amazon aws access key'
+# sharedkey = 'amazon aws shared key'
+# gpgsymmetrickey = 'gpg symmetric key -- make it good, but do not lose it'
+#
+# Copyright (c) 2009-2011 Ryan S. Tucker
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+import glacier_api
+import os
+import peewee
+import secrets
+import sys
+import time
+
+from backup_logger import logger
+from glacier_api import GlacierReference
+
+requireAwsArgs = 0
+
+def fetch_file(vault, reference, directory):
+    path = directory + "/.glacier." + reference.glacierId
+    if os.path.isfile(path) != True:
+        file = open(path, 'w+')
+    else:
+        file = open(path, 'a+')
+
+    status = file.readline()
+
+    logger.debug('Restoring remote file "%s", status "%s"' % (reference.glacierId, status))
+
+    if status == '':
+        job = vault.retrieve_archive(reference.glacierId)
+        logger.debug('Created job id "%s"' % job.id)
+        file.write('id:%s' % job.id)
+        file.close();
+
+        while True:
+            if os.path.isfile(directory + ".glacier-restore"):
+                logger.info('Files are available, restoring');
+                break;
+            logger.info('Waiting for files to be available (next poll in 5mn)')
+            time.sleep(600);
+    else:
+        if status[:3] == 'id:':
+            job = vault.get_job(status[3:])
+            logger.debug('Job %s in progress, completed : %s' % (job.id, job.completed));
+            logger.debug('Job not submitted, waiting for current one to complete.');
+        else:
+            logger.debug('Status is not an id : %s' % status)
+
+        file.close()
+
+def unfreeze_directory(host, backupNumber, directory):
+
+    logger.debug('Unfreezing ' + directory)
+
+    glacier_api.create_tables();
+
+    query = (GlacierReference
+             .select()
+             .where((GlacierReference.host == host) & (GlacierReference.backupNumber == backupNumber)))
+
+    for reference in query:
+        logger.debug("Found reference to submit")
+        fetch_file(glacier_api.open_store(secrets.accesskey, secrets.sharedkey, ""), reference, directory);
+
+if __name__ == '__main__':
+    if len(sys.argv) != 4:
+        sys.stderr.write("Usage: %s host, number, frozenPath\n" % sys.argv[0])
+        sys.stderr.write("Got %d args instead: %s\n" % (len(sys.argv), ", ".join(sys.argv)))
+        sys.exit(1)
+
+    import urllib
+
+    directory = '/var/lib/backuppc/pc/%s/%s/%s' % (sys.argv[1], sys.argv[2], urllib.quote_plus('f' + sys.argv[3]).replace('%2F', '%2f'))
+
+    logger.debug(directory)
+    unfreeze_directory(sys.argv[1], sys.argv[2], directory);
+

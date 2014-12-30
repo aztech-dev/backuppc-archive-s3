@@ -32,56 +32,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
+import boto
+import glacier_api
 import glob
-import hashlib
 import os
+import s3_api
+import secrets
 import socket
 import sys
 import time
 
+from backup_logger import logger
 from multiprocessing import Process, Queue, cpu_count
 from subprocess import *
 
-from boto.s3.connection import S3Connection
-from boto.s3.key import Key
-import boto.exception
-import boto
-
-import logging
-import logging.handlers
-from boto.glacier.exceptions import UnexpectedHTTPResponseError
-
-try:
-    import secrets
-    requireAwsArgs = 0
-except ImportError:
-    requireAwsArgs = 1
-
-import peewee;
-from peewee import *
-
-logger = logging.getLogger(__name__)
-
-consolehandler = logging.StreamHandler(sys.stdout)
-consoleformatter = logging.Formatter('%(asctime)s: %(levelname)s: %(message)s')
-consolehandler.setFormatter(consoleformatter)
-logger.addHandler(consolehandler)
-
-logger.setLevel(logging.DEBUG)
-
-class VerifyError(Exception):
-    pass
-
-db = MySQLDatabase('backuppc', 'backuppc', 'backuppc')
-
-class GlacierReference(peewee.Model):
-    host = peewee.CharField()
-    backupNumber = peewee.CharField()
-    shareName = peewee.CharField()
-    glacierId = peewee.TextField()
-
-    class Meta:
-        database = db
+requireAwsArgs = 0
 
 def is_exe(fpath):
     return os.path.exists(fpath) and os.access(fpath, os.X_OK)
@@ -116,87 +81,6 @@ def encrypt_file(filename, key, compress='/bin/cat'):
     else:
         raise RuntimeError('output file does not exist: %s.gpg' % filename)
 
-def open_glacier(accesskey, sharedKey, host):
-    logger.debug('Connecting with creds %s : %s to Glacier' % (accesskey, sharedKey))
-    try:
-        conn = boto.connect_glacier(aws_access_key_id=accesskey,
-                                    aws_secret_access_key=sharedKey)
-    except UnexpectedHTTPResponseError as e:
-        logger.error('unable to connect to Glacier : HTTP %d - %s' %s (e.status, e.message))
-        sys.exit(2)
-
-    myvaultname = ('backup')
-    try:
-        vault = conn.get_vault(myvaultname)
-    except UnexpectedHTTPResponseError:
-        try:
-            logger.info('open_glacier: creating new vault %s' % myvaultname)
-            vault = conn.create_vault(myvaultname)
-        except UnexpectedHTTPResponseError as e:
-            logger.error('unable to create vault %s : HTTP %d - %s' % (myvaultname, e.status, e.message))
-            sys.exit(3)
-
-    return vault
-
-def open_s3(accesskey, sharedkey, host):
-    conn = S3Connection(accesskey, sharedkey, is_secure=True)
-    mybucketname = (accesskey + '-bkup-' + host).lower()
-    try:
-        bucket = conn.get_bucket(mybucketname)
-    except boto.exception.S3ResponseError:
-        logger.info('open_s3: creating new bucket %s' % mybucketname)
-        bucket = conn.create_bucket(mybucketname)
-    bucket.set_acl('private')
-    return bucket
-
-def handle_progress(transmitted, pending):
-    logger.debug("send_file: %i of %i bytes transmitted (%.2f%%)", transmitted, pending, (transmitted/float(pending))*100)
-
-def verify_file(bucket, filename):
-    "Returns True if the file size and md5sum match, False otherwise"
-    basefilename = os.path.basename(filename)
-    key = bucket.get_key(basefilename)
-    stat = os.stat(filename)
-    if key:
-        if key.size == stat[6]:
-            fp = open(filename)
-            local_md5 = hashlib.md5(fp.read())
-            fp.close()
-            logger.debug('verify_file: %s: local md5 "%s", etag %s', filename, local_md5.hexdigest(), key.etag)
-            if '"%s"' % local_md5.hexdigest() == key.etag:
-                return True
-    return False
-
-def send_file_glacier(vault, filename):
-    basefilename = os.path.basename(filename)
-    id = vault.upload_archive(filename)
-    logger.debug("send_file: %s sent, received id %s", filename, id)
-    logger.debug('send_file: storing relationship in db')
-
-    GlacierReference.create_table()
-    ref = GlacierReference(host='192.168.50.1', backupNumber=0, shareName=filename, glacierId=id)
-    ref.save()
-
-    return id
-
-def send_file(bucket, filename):
-    basefilename = os.path.basename(filename)
-    k = Key(bucket)
-    k.key = basefilename
-
-    if k.exists():
-        if verify_file(bucket, filename):
-            logger.warning("send_file: %s already exists and is identical, not overwriting", basefilename)
-            return k
-        logger.warning("send_file: %s already exists on S3, overwriting", basefilename)
-
-    k.set_contents_from_filename(filename, cb=handle_progress, reduced_redundancy=True)
-
-    logger.debug("send_file: %s sent, verifying fidelity", filename)
-    if not verify_file(bucket, filename):
-        raise VerifyError("verify failed")
-    return k
-
 def encryption_worker(in_q, out_q, unlink_q):
     "Encrypts things from the in_q, puts them in the out_q"
     start_time = time.time()
@@ -212,7 +96,7 @@ def encryption_worker(in_q, out_q, unlink_q):
     logger.debug("encryption_worker: queue is empty, terminating after %i items in %i seconds", counter, time.time()-start_time)
     time.sleep(5)   # settle
 
-def sending_worker(in_q, out_q, accesskey, sharedkey, host):
+def sending_worker(in_q, out_q, accesskey, sharedkey, host, number):
     "Sends things from the in_q using the send_file method"
     start_time = time.time()
     counter = 0
@@ -226,12 +110,11 @@ def sending_worker(in_q, out_q, accesskey, sharedkey, host):
         while retry_count <= max_retries and not done:
             try:
                 logger.info("sending_worker: sending %s", filename)
-                bucket = open_glacier(accesskey, sharedkey, host)
-                send_file_glacier(bucket, filename)
-                #key.set_acl('private')
-                #key.close()
+                bucket = glacier_api.open_store(accesskey, sharedkey, host)
+                glacier_api.send(bucket, filename, number)
+
                 done = True
-            except (boto.exception.S3ResponseError, socket.error, VerifyError), e:
+            except (boto.exception.S3ResponseError, socket.error, s3_api.VerifyError), e:
                 retry_count += 1
                 sleeptime = 2**retry_count
                 logger.error('sending_worker: exception %s, retrying in %i seconds (%i/%i)', e, sleeptime, retry_count, max_retries)
@@ -266,7 +149,7 @@ def unlink_worker(in_q):
 
 if __name__ == '__main__':
     # Read in arguments, verify that they match the BackupPC standard exactly
-    if len(sys.argv) != 12 and (requireAwsArgs and len(sys.argv) != 15):
+    if len(sys.argv) < 10 and (requireAwsArgs == 1 and len(sys.argv) != 15):
         sys.stderr.write("Usage: %s tarCreatePath splitPath parPath host bkupNum compPath fileExt splitSize outLoc parFile share\n" % sys.argv[0])
         sys.stderr.write("Got %d args instead: %s\n" % (len(sys.argv), ", ".join(sys.argv)))
         sys.exit(1)
@@ -277,7 +160,7 @@ if __name__ == '__main__':
         else:
             awsAccessKey = secrets.accesskey
             awsSecretKey = secrets.sharedkey
-            awsVaultName = 'vault'
+            awsVaultName = secrets.vault
 
         tarCreate   = sys.argv[1 + offset]
         splitPath   = sys.argv[2 + offset]
@@ -291,11 +174,6 @@ if __name__ == '__main__':
         fileExt     = sys.argv[7 + offset]
         splitSize   = int(sys.argv[8 + offset])
         outLoc      = sys.argv[9 + offset]
-        parfile     = sys.argv[10 + offset]
-        share       = sys.argv[11 + offset]
-        awsAccessKey = "";
-        awsSecretKey = "";
-        awsVaultName = "";
 
     if len(sys.argv) == 15:
         awsAccessKey = sys.argv[1];
@@ -349,14 +227,13 @@ if __name__ == '__main__':
     else:
         mesg = "Writing archive for host %s, backup #%i" % (host, bkupNum)
 
-        tarcmd = [tarCreate, '-t']
-        tarcmd.extend(['-h', host])
-        tarcmd.extend(['-n', str(bkupNum)])
-        tarcmd.extend(['-s', share])
-        tarcmd.extend(['.'])
+        outfile = '%s/%s.%i.tar' % (outLoc, host, bkupNum)
+
+        tarcmd = [tarCreate, '-czvf' ]
+        tarcmd.extend([ outfile ]);
+        tarcmd.extend(["/var/lib/backuppc/pc/%s/%s" % (host, bkupNum) ]);
 
         splitcmd = None
-        outfile = '%s/%s.%i.tar' % (outLoc, host, bkupNum)
 
         if splitSize > 0 and is_exe(splitPath):
             filehead = outfile + '.'
@@ -371,7 +248,7 @@ if __name__ == '__main__':
             mesg += ', encrypted with secret key'
 
         logger.info("main: %s", mesg)
-        logger.debug("main: executing tarcmd: %s > %s", ' '.join(tarcmd), outfile)
+        logger.debug("main: executing tarcmd: %s", ' '.join(tarcmd))
 
         tarfp = open(outfile, 'wb')
         proc = Popen(tarcmd, preexec_fn=lambda : os.nice(10), stdout=tarfp)
@@ -420,7 +297,7 @@ if __name__ == '__main__':
         p.start()
         procs.append(p)
 
-    send_p = Process(name="send_worker", target=sending_worker, args=(send_queue, unlink_queue, awsAccessKey, awsSecretKey, host))
+    send_p = Process(name="send_worker", target=sending_worker, args=(send_queue, unlink_queue, awsAccessKey, awsSecretKey, host, bkupNum))
     send_p.start()
     procs.append(send_p)
 
@@ -475,3 +352,5 @@ if __name__ == '__main__':
             logger.debug("main: queue %s is empty", qname)
 
     logger.info("main: completed run after %i seconds", (time.time() - beginning))
+
+    exit(0)
